@@ -35,6 +35,8 @@
 #include <math.h>
 #include <errno.h>
 
+#include <assert.h> /* TODO: remove me and assertions too */
+
 /* Apparently sscanf is not implemented in some "standard" libraries, so don't use it, if you
  * don't have to. */
 #define sscanf THINK_TWICE_ABOUT_USING_SSCANF
@@ -122,13 +124,13 @@ static JSON_Status  skip_quotes(const char **string);
 static int          parse_utf16(const char **unprocessed, char **processed);
 static char *       process_string(const char *input, size_t len);
 static char *       get_quoted_string(const char **string);
-static JSON_Value * parse_object_value(const char **string, size_t nesting);
-static JSON_Value * parse_array_value(const char **string, size_t nesting);
+static JSON_Value * parse_object_value(const char **string);
+static JSON_Value * parse_array_value(const char **string);
 static JSON_Value * parse_string_value(const char **string);
 static JSON_Value * parse_boolean_value(const char **string);
 static JSON_Value * parse_number_value(const char **string);
 static JSON_Value * parse_null_value(const char **string);
-static JSON_Value * parse_value(const char **string, size_t nesting);
+static JSON_Value * parse_value(const char **string);
 
 /* Serialization */
 static int    json_serialize_to_buffer_r(const JSON_Value *value, char *buf, int level, int is_pretty, char *num_buf);
@@ -441,6 +443,9 @@ static JSON_Array * json_array_init(JSON_Value *wrapping_value) {
 }
 
 static JSON_Status json_array_add(JSON_Array *array, JSON_Value *value) {
+    if (array == NULL || value == NULL) {
+        return JSONFailure;
+    }
     if (array->count >= array->capacity) {
         size_t new_capacity = MAX(array->capacity * 2, STARTING_CAPACITY);
         if (new_capacity > ARRAY_MAX_CAPACITY) {
@@ -629,121 +634,246 @@ static char * get_quoted_string(const char **string) {
     return process_string(string_start + 1, string_len);
 }
 
-static JSON_Value * parse_value(const char **string, size_t nesting) {
-    if (nesting > MAX_NESTING) {
-        return NULL;
-    }
-    SKIP_WHITESPACES(string);
+static JSON_Value * parse_simple_value(const char **string, int *status) {
+    JSON_Value *result = NULL;
     switch (**string) {
-        case '{':
-            return parse_object_value(string, nesting + 1);
-        case '[':
-            return parse_array_value(string, nesting + 1);
         case '\"':
-            return parse_string_value(string);
+            result = parse_string_value(string);
+            break;
         case 'f': case 't':
-            return parse_boolean_value(string);
+            result = parse_boolean_value(string);
+            break;
         case '-':
         case '0': case '1': case '2': case '3': case '4':
         case '5': case '6': case '7': case '8': case '9':
-            return parse_number_value(string);
+            result = parse_number_value(string);
+            break;
         case 'n':
-            return parse_null_value(string);
-        default:
-            return NULL;
+            result = parse_null_value(string);
+            break;
     }
+    *status = result == NULL ? JSONFailure : JSONSuccess;
+    return result;
 }
 
-static JSON_Value * parse_object_value(const char **string, size_t nesting) {
-    JSON_Value *output_value = json_value_init_object(), *new_value = NULL;
-    JSON_Object *output_object = json_value_get_object(output_value);
-    char *new_key = NULL;
-    if (output_value == NULL || **string != '{') {
-        return NULL;
-    }
-    SKIP_CHAR(string);
-    SKIP_WHITESPACES(string);
-    if (**string == '}') { /* empty object */
-        SKIP_CHAR(string);
-        return output_value;
-    }
-    while (**string != '\0') {
-        new_key = get_quoted_string(string);
-        SKIP_WHITESPACES(string);
-        if (new_key == NULL || **string != ':') {
-            json_value_free(output_value);
-            return NULL;
+static int add_complex_value_element(JSON_Value **stack, size_t *depth) {
+    /* we found a comma, or closing brace/bracket there are three things that
+     * might have happened:
+     * (0) we are inside an object in which case the stack looks like this:
+     *         value <--- top
+     *         key
+     *         object
+     *         ... more on the bottom */
+    if (*depth >= 3) {
+        JSON_Value *value  = stack[*depth - 1];
+        JSON_Value *key    = stack[*depth - 2];
+        JSON_Value *object = stack[*depth - 3];
+        if (object->type == JSONObject && key->type == JSONString) {
+            JSON_Object *raw_object = json_value_get_object(object);
+            const char  *raw_key = json_value_get_string(key);
+            if (json_object_add(raw_object, raw_key, value) == JSONFailure) {
+                return JSONFailure;
+            }
+            *depth = *depth - 2;
+            return JSONSuccess;
         }
-        SKIP_CHAR(string);
-        new_value = parse_value(string, nesting);
-        if (new_value == NULL) {
-            parson_free(new_key);
-            json_value_free(output_value);
-            return NULL;
-        }
-        if (json_object_add(output_object, new_key, new_value) == JSONFailure) {
-            parson_free(new_key);
-            json_value_free(new_value);
-            json_value_free(output_value);
-            return NULL;
-        }
-        parson_free(new_key);
-        SKIP_WHITESPACES(string);
-        if (**string != ',') {
-            break;
-        }
-        SKIP_CHAR(string);
-        SKIP_WHITESPACES(string);
     }
-    SKIP_WHITESPACES(string);
-    if (**string != '}' || /* Trim object after parsing is over */
-        json_object_resize(output_object, json_object_get_count(output_object)) == JSONFailure) {
-            json_value_free(output_value);
-            return NULL;
+    /* (1) we are inside an array in which case the stack looks like this:
+     *         value <--- top
+     *         array
+     *         ... more on the bottom */
+    if (*depth >= 2) {
+        JSON_Value *value = stack[*depth - 1];
+        JSON_Value *array = stack[*depth - 2];
+        if (array->type == JSONArray) {
+            JSON_Array *raw_array = json_value_get_array(array);
+            if (json_array_add(raw_array, value) == JSONFailure) {
+                return JSONFailure;
+            }
+            *depth = *depth - 1;
+            return JSONSuccess;
+        }
     }
-    SKIP_CHAR(string);
-    return output_value;
+    /* (2) we are inside empty array or object in such case array or object
+     *     should be on the top of the stack. It is important to check this
+     *     case as the last one (nested arrays and objects in other arrays and
+     *     objects). */
+    if (*depth >= 1) {
+        JSON_Value *top = stack[*depth - 1];
+        if (top->type == JSONArray || top->type == JSONObject) {
+            return JSONSuccess;
+        }
+    }
+    
+    //assert(0 && "TODO: syntax error");
+    return JSONFailure;
 }
 
-static JSON_Value * parse_array_value(const char **string, size_t nesting) {
-    JSON_Value *output_value = json_value_init_array(), *new_array_value = NULL;
-    JSON_Array *output_array = json_value_get_array(output_value);
-    if (!output_value || **string != '[') {
-        return NULL;
-    }
-    SKIP_CHAR(string);
-    SKIP_WHITESPACES(string);
-    if (**string == ']') { /* empty array */
-        SKIP_CHAR(string);
-        return output_value;
-    }
-    while (**string != '\0') {
-        new_array_value = parse_value(string, nesting);
-        if (new_array_value == NULL) {
-            json_value_free(output_value);
-            return NULL;
-        }
-        if (json_array_add(output_array, new_array_value) == JSONFailure) {
-            json_value_free(new_array_value);
-            json_value_free(output_value);
-            return NULL;
-        }
-        SKIP_WHITESPACES(string);
-        if (**string != ',') {
+#define MAX_STACK_DEPTH 2048
+
+static JSON_Value * parse_value(const char **string) {
+    JSON_Value *stack[MAX_STACK_DEPTH] = {NULL};
+    size_t depth = 0;
+    int status = JSONSuccess;
+
+    //while (status == JSONSuccess && *string && depth < MAX_STACK_DEPTH) {
+    while (1) {
+        if (status != JSONSuccess) {
+            puts("failure");
             break;
         }
-        SKIP_CHAR(string);
+        if (*string == 0) {
+            puts("*string is null");
+            break;
+        }
+        if (depth >= MAX_STACK_DEPTH) {
+            puts("depth exceeded");
+            break;
+        }
         SKIP_WHITESPACES(string);
+        switch (**string) {
+            case '{':
+                SKIP_CHAR(string); /* consume '{' */
+                stack[depth++] = json_value_init_object();
+                break;
+            case '[':
+                SKIP_CHAR(string); /* consume '[' */
+                stack[depth++] = json_value_init_array();
+                break;
+            case '}':
+                SKIP_CHAR(string); /* consume '}' */
+                status = add_complex_value_element(stack, &depth);
+                if (status != JSONSuccess) {
+                    puts("closing brace");
+                }
+                break;
+            case ']':
+                SKIP_CHAR(string); /* consume ']' */
+                status = add_complex_value_element(stack, &depth);
+                if (status != JSONSuccess) {
+                    puts("closing bracket");
+                }
+                break;
+            case ':':
+                SKIP_CHAR(string); /* consume ':' */
+                /* TODO: currently ignored place it on stack to enforce ':'
+                 * presence in object definitions */
+                break;
+            case ',':
+                SKIP_CHAR(string); /* consume ',' */
+                status = add_complex_value_element(stack, &depth);
+                if (status != JSONSuccess) {
+                    puts("comma");
+                }
+                break;
+            default:
+                stack[depth++] = parse_simple_value(string, &status);
+                if (status != JSONSuccess) {
+                    puts("simple value");
+                }
+                break;
+            case '\0':
+                return stack[0];
+        }
     }
-    SKIP_WHITESPACES(string);
-    if (**string != ']' || /* Trim array after parsing is over */
-        json_array_resize(output_array, json_array_get_count(output_array)) == JSONFailure) {
-            json_value_free(output_value);
-            return NULL;
-    }
-    SKIP_CHAR(string);
-    return output_value;
+
+    //puts("oh no!");
+    /* something failed druing parsing, go through stack and free everything
+     * that we allocated so far */
+    //assert(0 && "not implemented!");
+    return NULL;
 }
+
+//static JSON_Value * parse_object_value(const char **string, size_t nesting) {
+//    JSON_Value *output_value = json_value_init_object(), *new_value = NULL;
+//    JSON_Object *output_object = json_value_get_object(output_value);
+//    char *new_key = NULL;
+//    if (output_value == NULL || **string != '{') {
+//        return NULL;
+//    }
+//    SKIP_CHAR(string);
+//    SKIP_WHITESPACES(string);
+//    if (**string == '}') { /* empty object */
+//        SKIP_CHAR(string);
+//        return output_value;
+//    }
+//    while (**string != '\0') {
+//        new_key = get_quoted_string(string);
+//        SKIP_WHITESPACES(string);
+//        if (new_key == NULL || **string != ':') {
+//            json_value_free(output_value);
+//            return NULL;
+//        }
+//        SKIP_CHAR(string);
+//        new_value = parse_value(string, nesting);
+//        if (new_value == NULL) {
+//            parson_free(new_key);
+//            json_value_free(output_value);
+//            return NULL;
+//        }
+//        if (json_object_add(output_object, new_key, new_value) == JSONFailure) {
+//            parson_free(new_key);
+//            json_value_free(new_value);
+//            json_value_free(output_value);
+//            return NULL;
+//        }
+//        parson_free(new_key);
+//        SKIP_WHITESPACES(string);
+//        if (**string != ',') {
+//            break;
+//        }
+//        SKIP_CHAR(string);
+//        SKIP_WHITESPACES(string);
+//    }
+//    SKIP_WHITESPACES(string);
+//    if (**string != '}' || /* Trim object after parsing is over */
+//        json_object_resize(output_object, json_object_get_count(output_object)) == JSONFailure) {
+//            json_value_free(output_value);
+//            return NULL;
+//    }
+//    SKIP_CHAR(string);
+//    return output_value;
+//}
+
+//static JSON_Value * parse_array_value(const char **string, size_t nesting) {
+//    JSON_Value *output_value = json_value_init_array(), *new_array_value = NULL;
+//    JSON_Array *output_array = json_value_get_array(output_value);
+//    if (!output_value || **string != '[') {
+//        return NULL;
+//    }
+//    SKIP_CHAR(string);
+//    SKIP_WHITESPACES(string);
+//    if (**string == ']') { /* empty array */
+//        SKIP_CHAR(string);
+//        return output_value;
+//    }
+//    while (**string != '\0') {
+//        new_array_value = parse_value(string, nesting);
+//        if (new_array_value == NULL) {
+//            json_value_free(output_value);
+//            return NULL;
+//        }
+//        if (json_array_add(output_array, new_array_value) == JSONFailure) {
+//            json_value_free(new_array_value);
+//            json_value_free(output_value);
+//            return NULL;
+//        }
+//        SKIP_WHITESPACES(string);
+//        if (**string != ',') {
+//            break;
+//        }
+//        SKIP_CHAR(string);
+//        SKIP_WHITESPACES(string);
+//    }
+//    SKIP_WHITESPACES(string);
+//    if (**string != ']' || /* Trim array after parsing is over */
+//        json_array_resize(output_array, json_array_get_count(output_array)) == JSONFailure) {
+//            json_value_free(output_value);
+//            return NULL;
+//    }
+//    SKIP_CHAR(string);
+//    return output_value;
+//}
 
 static JSON_Value * parse_string_value(const char **string) {
     JSON_Value *value = NULL;
@@ -1056,7 +1186,7 @@ JSON_Value * json_parse_string(const char *string) {
     if (string[0] == '\xEF' && string[1] == '\xBB' && string[2] == '\xBF') {
         string = string + 3; /* Support for UTF-8 BOM */
     }
-    return parse_value((const char**)&string, 0);
+    return parse_value((const char**)&string);
 }
 
 JSON_Value * json_parse_string_with_comments(const char *string) {
@@ -1069,7 +1199,7 @@ JSON_Value * json_parse_string_with_comments(const char *string) {
     remove_comments(string_mutable_copy, "/*", "*/");
     remove_comments(string_mutable_copy, "//", "\n");
     string_mutable_copy_ptr = string_mutable_copy;
-    result = parse_value((const char**)&string_mutable_copy_ptr, 0);
+    result = parse_value((const char**)&string_mutable_copy_ptr);
     parson_free(string_mutable_copy);
     return result;
 }
