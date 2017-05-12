@@ -124,8 +124,6 @@ static JSON_Status  skip_quotes(const char **string);
 static int          parse_utf16(const char **unprocessed, char **processed);
 static char *       process_string(const char *input, size_t len);
 static char *       get_quoted_string(const char **string);
-static JSON_Value * parse_object_value(const char **string);
-static JSON_Value * parse_array_value(const char **string);
 static JSON_Value * parse_string_value(const char **string);
 static JSON_Value * parse_boolean_value(const char **string);
 static JSON_Value * parse_number_value(const char **string);
@@ -656,30 +654,6 @@ static JSON_Value * parse_simple_value(const char **string, int *status) {
     return result;
 }
 
-struct parse_stack_t {
-    int closed;
-    JSON_Value *value;
-};
-
-static void print_stack(struct parse_stack_t *stack, size_t depth) {
-    size_t i = 0;
-    printf("-- stack depth: %zu --\n", depth);
-    for (i = 0; i < depth; i++) {
-        JSON_Value *v = stack[i].value;
-        printf("%d ", stack[i].closed);
-        switch (v->type) {
-#define type(t) case t: puts(#t); break;
-            type(JSONError)
-            type(JSONObject)
-            type(JSONArray)
-            type(JSONString)
-            default: puts("?!"); break;
-#undef type
-        }
-    }
-    puts("-- top --\n");
-}
-
 static int is_complex_value_empty(const JSON_Value *value) {
     if (value->type == JSONArray) {
         JSON_Array *array = json_value_get_array(value);
@@ -691,17 +665,24 @@ static int is_complex_value_empty(const JSON_Value *value) {
     return 0;
 }
 
+struct parse_stack_t {
+    int closed;
+    JSON_Value *value;
+};
+
 static int add_complex_value_element
         (struct parse_stack_t *stack, size_t *depth, int close) {
-    /* (2) we are inside empty array or object in such case array or object
-     *     should be on the top of the stack. It is important to check this
-     *     case as the last one (nested arrays and objects in other arrays and
-     *     objects). */
+    /* we found a comma, or closing brace/bracket there are three things that
+     * might have happened:
+     * (0) we are inside empty array or object in such case array or object
+     *     should be on the top of the stack. */
     if (*depth >= 1 && close) {
         struct parse_stack_t top = stack[*depth - 1];
         if (top.closed == 0 && 
                 (top.value->type == JSONArray || top.value->type == JSONObject)) {
-            //puts(" --- empty value pattern matched");
+            /* If we matched this pattern, but the object is not empty, then
+             * the clsoing ']' or '}' must have been preceeded by dangling
+             * comma that consumed entries from the stack. */
             if (is_complex_value_empty(top.value) == 0) {
                 /* dangling comma */
                 return JSONFailure;
@@ -710,10 +691,7 @@ static int add_complex_value_element
             return JSONSuccess;
         }
     }
-    
-    /* we found a comma, or closing brace/bracket there are three things that
-     * might have happened:
-     * (0) we are inside an object in which case the stack looks like this:
+    /* (1) we are inside an object in which case the stack looks like this:
      *         value <--- top
      *         key
      *         object
@@ -727,7 +705,6 @@ static int add_complex_value_element
 
         if (object->type == JSONObject && object_closed == 0
                 && key->type == JSONString) {
-            //puts(" --- object element pattern matched");
             JSON_Object *raw_object = json_value_get_object(object);
             const char  *raw_key = json_value_get_string(key);
             if (json_object_add(raw_object, raw_key, value) == JSONFailure) {
@@ -740,7 +717,7 @@ static int add_complex_value_element
             return JSONSuccess;
         }
     }
-    /* (1) we are inside an array in which case the stack looks like this:
+    /* (2) we are inside an array in which case the stack looks like this:
      *         value <--- top
      *         array
      *         ... more on the bottom */
@@ -751,7 +728,6 @@ static int add_complex_value_element
         int array_closed = stack[*depth - 2].closed;
 
         if (array->type == JSONArray && array_closed == 0) {
-            //puts(" --- array element pattern matched");
             JSON_Array *raw_array = json_value_get_array(array);
             if (json_array_add(raw_array, value) == JSONFailure) {
                 return JSONFailure;
@@ -763,7 +739,6 @@ static int add_complex_value_element
             return JSONSuccess;
         }
     }
-    //assert(0 && "TODO: syntax error");
     return JSONFailure;
 }
 
@@ -774,92 +749,57 @@ static JSON_Value * parse_value(const char **string) {
     size_t depth = 0;
     int status = JSONSuccess;
     
-    /* to correctly hanlde empty string: */
+    /* zero first item to correctly hanlde empty string: */
     stack[0].closed = 0;
     stack[0].value = NULL;
 
-    //while (status == JSONSuccess && *string && depth < MAX_STACK_DEPTH) {
-    while (1) {
-        if (status != JSONSuccess) {
-            //puts("failure");
-            break;
-        }
-        if (*string == 0) {
-            //puts("*string is null");
-            break;
-        }
-        if (depth >= MAX_STACK_DEPTH) {
-            //puts("depth exceeded");
-            break;
-        }
+    while (status == JSONSuccess && *string && depth < MAX_STACK_DEPTH) {
         SKIP_WHITESPACES(string);
-        //print_stack(stack, depth);
         switch (**string) {
             case '{':
-                SKIP_CHAR(string); /* consume '{' */
-                stack[depth].closed = 0;
-                stack[depth].value = json_value_init_object();
-                depth++;
-                //puts("## event: {");
-                break;
             case '[':
-                SKIP_CHAR(string); /* consume '[' */
                 stack[depth].closed = 0;
-                stack[depth].value = json_value_init_array();
+                stack[depth].value = **string == '{' 
+                                   ? json_value_init_object()
+                                   : json_value_init_array();
+                if (stack[depth].value == NULL) {
+                    status = JSONFailure;
+                }
+                SKIP_CHAR(string);
                 depth++;
-                //puts("## event: [");
                 break;
             case '}':
-                SKIP_CHAR(string); /* consume '}' */
-                status = add_complex_value_element(stack, &depth, 1);
-                //if (status != JSONSuccess) {
-                //    puts("closing brace");
-                //}
-                //puts("## event: }");
-                break;
             case ']':
-                SKIP_CHAR(string); /* consume ']' */
+                SKIP_CHAR(string);
                 status = add_complex_value_element(stack, &depth, 1);
-                //if (status != JSONSuccess) {
-                //    puts("closing bracket");
-                //}
-                //puts("## event: ]");
                 break;
             case ':':
-                SKIP_CHAR(string); /* consume ':' */
+                SKIP_CHAR(string);
                 /* TODO: currently ignored place it on stack to enforce ':'
                  * presence in object definitions */
                 break;
             case ',':
-                SKIP_CHAR(string); /* consume ',' */
+                SKIP_CHAR(string);
                 status = add_complex_value_element(stack, &depth, 0);
-                //if (status != JSONSuccess) {
-                //    puts("comma");
-                //}
-                //puts("## event: ,");
+                break;
+            case '\0':
+                if (stack[0].closed) {
+                    return stack[0].value;
+                }
+                status = JSONFailure;
                 break;
             default:
                 stack[depth].closed = 1;
                 stack[depth].value = parse_simple_value(string, &status);
                 depth++;
-                //if (status != JSONSuccess) {
-                //    puts("simple value");
-                //}
-                //puts("## event: value");
                 break;
-            case '\0':
-                if (stack[0].closed) {
-                    return stack[0].value;
-                } else {
-                    status = JSONFailure;
-                }
         }
     }
-
-    //puts("oh no!");
     /* something failed druing parsing, go through stack and free everything
      * that we allocated so far */
-    //assert(0 && "not implemented!");
+    while (depth--) {
+        json_value_free(stack[depth].value);
+    }
     return NULL;
 }
 
