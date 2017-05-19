@@ -710,6 +710,7 @@ static int add_complex_value_element
             if (json_object_add(raw_object, raw_key, value) == JSONFailure) {
                 return JSONFailure;
             }
+            json_value_free(key); /* json_object_add makes a copy */
             if (close) {
                 stack[*depth - 3].closed = 1;
             }
@@ -770,17 +771,14 @@ static JSON_Value * parse_value(const char **string) {
                 break;
             case '}':
             case ']':
+            case ',':
+                status = add_complex_value_element(stack, &depth, **string != ',');
                 SKIP_CHAR(string);
-                status = add_complex_value_element(stack, &depth, 1);
                 break;
             case ':':
                 SKIP_CHAR(string);
                 /* TODO: currently ignored place it on stack to enforce ':'
                  * presence in object definitions */
-                break;
-            case ',':
-                SKIP_CHAR(string);
-                status = add_complex_value_element(stack, &depth, 0);
                 break;
             case '\0':
                 if (stack[0].closed) {
